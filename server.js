@@ -79,7 +79,7 @@ async function checkAndDeductCredit(req, res, next) {
   }
 
   // Check limits
-  const limit = profile.plan === 'pro' ? 999 : profile.plan === 'sharp' ? 9999 : 3;
+  const limit = profile.plan === 'pro' ? 10 : profile.plan === 'sharp' ? 9999 : 3;
   if (profile.analyses_today >= limit) {
     return res.status(429).json({
       error: 'Daily limit reached',
@@ -244,7 +244,7 @@ app.get('/api/me', requireAuth, async (req, res) => {
     .eq('id', req.user.id)
     .single();
 
-  const limits = { free: 3, pro: 999, sharp: 9999 };
+  const limits = { free: 3, pro: 10, sharp: 9999 };
   const plan = profile?.plan || 'free';
   const used = profile?.analyses_today || 0;
   const limit = limits[plan];
