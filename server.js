@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
@@ -8,6 +9,11 @@ const path = require('path');
 
 const app = express();
 const upload = multer({ limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB limit
+
+// ── ANALYSIS CACHE ──
+// Keyed by SHA-256 hash of (image bytes + sport + context).
+// Same slip submitted again returns the identical result instantly — no AI call, no credit used.
+const analysisCache = new Map();
 
 // Supabase client
 const supabase = createClient(
@@ -99,6 +105,22 @@ app.post('/api/analyze', requireAuth, checkAndDeductCredit, upload.single('image
     const { sport, context, betText, manualLegs, inputMode } = req.body;
     const imageFile = req.file;
 
+    // ── CACHE CHECK ──
+    // Hash the raw input so identical submissions always return the same result.
+    const hashInput = [
+      imageFile ? imageFile.buffer : Buffer.from(betText || manualLegs || ''),
+      sport || '',
+      context || ''
+    ];
+    const cacheKey = crypto.createHash('sha256')
+      .update(Buffer.concat(hashInput.map(i => Buffer.isBuffer(i) ? i : Buffer.from(String(i)))))
+      .digest('hex');
+
+    if (analysisCache.has(cacheKey)) {
+      // Return cached result — no AI call, no credit deducted
+      return res.json({ success: true, data: analysisCache.get(cacheKey), cached: true });
+    }
+
     // Build message content for Claude
     const content = [];
 
@@ -155,6 +177,9 @@ app.post('/api/analyze', requireAuth, checkAndDeductCredit, upload.single('image
         .replace(/([^\\])\\t/g, '$1 ');
       result = JSON.parse(fixed);
     }
+
+    // Store in cache so re-submitting the same slip returns identical results
+    analysisCache.set(cacheKey, result);
 
     // Deduct one credit
     await supabase
