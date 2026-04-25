@@ -127,6 +127,7 @@ app.post('/api/analyze', requireAuth, checkAndDeductCredit, upload.single('image
       body: JSON.stringify({
         model: 'claude-sonnet-4-5',
         max_tokens: 4000,
+        temperature: 0,
         system: getSystemPrompt(),
         messages: [{ role: 'user', content }]
       })
