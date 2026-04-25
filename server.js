@@ -116,9 +116,25 @@ app.post('/api/analyze', requireAuth, checkAndDeductCredit, upload.single('image
       .update(Buffer.concat(hashInput.map(i => Buffer.isBuffer(i) ? i : Buffer.from(String(i)))))
       .digest('hex');
 
+    // 1. Check in-memory cache (fastest — same server session)
     if (analysisCache.has(cacheKey)) {
-      // Return cached result — no AI call, no credit deducted
       return res.json({ success: true, data: analysisCache.get(cacheKey), cached: true });
+    }
+
+    // 2. Check persistent DB cache (survives server restarts)
+    const { data: dbCached } = await supabase
+      .from('analyses')
+      .select('result')
+      .eq('user_id', req.user.id)
+      .filter('result->>_cache_key', 'eq', cacheKey)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (dbCached?.result) {
+      const { _cache_key, ...cleanResult } = dbCached.result;
+      analysisCache.set(cacheKey, cleanResult); // warm memory cache too
+      return res.json({ success: true, data: cleanResult, cached: true });
     }
 
     // Build message content for Claude
@@ -178,7 +194,7 @@ app.post('/api/analyze', requireAuth, checkAndDeductCredit, upload.single('image
       result = JSON.parse(fixed);
     }
 
-    // Store in cache so re-submitting the same slip returns identical results
+    // Store clean result in memory cache
     analysisCache.set(cacheKey, result);
 
     // Deduct one credit
@@ -187,11 +203,11 @@ app.post('/api/analyze', requireAuth, checkAndDeductCredit, upload.single('image
       .update({ analyses_today: req.profile.analyses_today + 1 })
       .eq('id', req.user.id);
 
-    // Save analysis to history
+    // Save to history with cache key embedded so DB lookups work after restarts
     await supabase.from('analyses').insert({
       user_id: req.user.id,
       sport,
-      result,
+      result: { ...result, _cache_key: cacheKey },
       created_at: new Date().toISOString()
     });
 
