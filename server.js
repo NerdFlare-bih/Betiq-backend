@@ -488,7 +488,6 @@ app.post('/api/subscribe', requireAuth, async (req, res) => {
   try {
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      payment_method_types: ['card'],
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: `${process.env.FRONTEND_URL}/index.html?upgraded=true`,
       cancel_url: `${process.env.FRONTEND_URL}/pricing.html`,
