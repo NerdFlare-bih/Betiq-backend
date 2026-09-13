@@ -39,7 +39,12 @@ app.use(cors({
   },
   credentials: true
 }));
-app.use(express.json());
+// Skip JSON parsing for the webhook route — Stripe signature verification
+// needs the raw, unparsed request body, not a pre-parsed object.
+app.use((req, res, next) => {
+  if (req.originalUrl === '/api/webhook') return next();
+  express.json()(req, res, next);
+});
 
 // Serve frontend in production
 app.use(express.static(path.join(__dirname, '../frontend/public')));
