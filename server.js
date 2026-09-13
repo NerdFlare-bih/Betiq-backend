@@ -491,7 +491,8 @@ app.post('/api/subscribe', requireAuth, async (req, res) => {
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: `${process.env.FRONTEND_URL}/index.html?upgraded=true`,
       cancel_url: `${process.env.FRONTEND_URL}/pricing.html`,
-      metadata: { user_id: req.user.id, plan }
+      metadata: { user_id: req.user.id, plan },
+      managed_payments: { enabled: false }
     });
 
     res.json({ url: session.url });
