@@ -472,22 +472,26 @@ app.post('/api/analyze', requireAuth, checkAndDeductCredit, upload.single('image
 
 // ── STRIPE: CREATE CHECKOUT SESSION ──
 app.post('/api/subscribe', requireAuth, async (req, res) => {
-  const { plan } = req.body;
+  const { plan, billing } = req.body;
+  const period = billing === 'annual' ? 'annual' : 'monthly';
 
   const prices = {
-    pro: process.env.STRIPE_PRO_PRICE_ID,
-    sharp: process.env.STRIPE_SHARP_PRICE_ID
+    pro_monthly: process.env.STRIPE_PRO_MONTHLY_PRICE_ID,
+    pro_annual: process.env.STRIPE_PRO_ANNUAL_PRICE_ID,
+    sharp_monthly: process.env.STRIPE_SHARP_MONTHLY_PRICE_ID,
+    sharp_annual: process.env.STRIPE_SHARP_ANNUAL_PRICE_ID
   };
+  const priceId = prices[`${plan}_${period}`];
 
-  if (!prices[plan]) return res.status(400).json({ error: 'Invalid plan' });
+  if (!priceId) return res.status(400).json({ error: 'Invalid plan' });
 
   try {
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       payment_method_types: ['card'],
-      line_items: [{ price: prices[plan], quantity: 1 }],
-      success_url: `${process.env.FRONTEND_URL}/dashboard?upgraded=true`,
-      cancel_url: `${process.env.FRONTEND_URL}/pricing`,
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: `${process.env.FRONTEND_URL}/index.html?upgraded=true`,
+      cancel_url: `${process.env.FRONTEND_URL}/pricing.html`,
       metadata: { user_id: req.user.id, plan }
     });
 
