@@ -523,7 +523,7 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
 
     await supabase
       .from('profiles')
-      .update({ plan, stripe_customer_id: session.customer, stripe_subscription_id: session.subscription })
+      .update({ plan, plan_source: 'stripe', stripe_customer_id: session.customer, stripe_subscription_id: session.subscription })
       .eq('id', user_id);
   }
 
@@ -531,11 +531,56 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
     const sub = event.data.object;
     await supabase
       .from('profiles')
-      .update({ plan: 'free' })
+      .update({ plan: 'free', plan_source: null })
       .eq('stripe_subscription_id', sub.id);
   }
 
   res.json({ received: true });
+});
+
+// ── APPLE IAP: PRODUCT ID → PLAN MAPPING ──
+const APPLE_PLAN_BY_PRODUCT_ID = {
+  'com.betiq.app.pro.monthly': 'pro',
+  'com.betiq.app.pro.annual': 'pro',
+  'com.betiq.app.sharp.monthly': 'sharp',
+  'com.betiq.app.sharp.annual': 'sharp'
+};
+
+// ── APPLE IAP: RECONCILE ENTITLEMENT INTO profiles.plan ──
+// Called after a purchase, and at app launch/restore with the client's current
+// best entitlement (or productId: null if none). Trusts StoreKit 2's on-device
+// transaction verification rather than re-verifying server-side — deliberately
+// deferred past a full App Store Server Notifications V2 webhook for now.
+// Only ever downgrades a profile to free if that plan was set via Apple in the
+// first place, so it can never clobber an active Stripe subscription purchased
+// on the web with the same account.
+app.post('/api/apple-iap/sync', requireAuth, async (req, res) => {
+  const { productId } = req.body;
+  const userId = req.user.id;
+
+  let { data: profile } = await supabase.from('profiles').select('*').eq('id', userId).single();
+  if (!profile) {
+    const { data: newProfile } = await supabase
+      .from('profiles')
+      .insert({ id: userId, plan: 'free', analyses_today: 0, analyses_reset_date: new Date().toISOString().split('T')[0] })
+      .select()
+      .single();
+    profile = newProfile;
+  }
+
+  if (productId) {
+    const plan = APPLE_PLAN_BY_PRODUCT_ID[productId];
+    if (!plan) return res.status(400).json({ error: 'Unknown product id' });
+    await supabase.from('profiles').update({ plan, plan_source: 'apple' }).eq('id', userId);
+    return res.json({ plan });
+  }
+
+  if (profile.plan_source === 'apple') {
+    await supabase.from('profiles').update({ plan: 'free', plan_source: null }).eq('id', userId);
+    return res.json({ plan: 'free' });
+  }
+
+  res.json({ plan: profile.plan });
 });
 
 // ── GET USER PROFILE + CREDITS ──
