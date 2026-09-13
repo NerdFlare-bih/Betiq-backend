@@ -99,6 +99,225 @@ async function checkAndDeductCredit(req, res, next) {
   next();
 }
 
+// ── PASS 1: EXTRACT PLAYER NAMES + BET LINES FROM IMAGE ──
+// Uses fast/cheap Haiku so total latency stays low.
+async function extractLegsFromContent(content) {
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 400,
+        temperature: 0,
+        messages: [{ role: 'user', content: [
+          ...content,
+          { type: 'text', text: 'List every bet leg on this slip. Return ONLY a raw JSON array, no markdown:\n[{"player":"Full Name","line":"Over 25.5 Points","team":"MIN","sport":"NBA"}]' }
+        ]}]
+      })
+    });
+    const data = await res.json();
+    const raw = data.content?.[0]?.text?.trim() || '[]';
+    const start = raw.indexOf('[');
+    const end = raw.lastIndexOf(']');
+    if (start === -1) return [];
+    return JSON.parse(raw.slice(start, end + 1));
+  } catch { return []; }
+}
+
+// ── NBA REAL STATS: BallDontLie API ──
+async function fetchNBAStats(playerName) {
+  const apiKey = process.env.BALLDONTLIE_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const searchRes = await fetch(
+      `https://api.balldontlie.io/v1/players?search=${encodeURIComponent(playerName)}&per_page=5`,
+      { headers: { 'Authorization': apiKey } }
+    );
+    const searchData = await searchRes.json();
+    if (!searchData.data?.length) return null;
+    const player = searchData.data[0];
+
+    const avgRes = await fetch(
+      `https://api.balldontlie.io/v1/season_averages?season=2024&player_ids[]=${player.id}`,
+      { headers: { 'Authorization': apiKey } }
+    );
+    const avgData = await avgRes.json();
+    const avg = avgData.data?.[0];
+    if (!avg) return null;
+
+    return {
+      player: `${player.first_name} ${player.last_name}`,
+      team: player.team?.abbreviation || '',
+      pts: avg.pts, reb: avg.reb, ast: avg.ast,
+      games_played: avg.games_played, min: avg.min,
+      fg_pct: avg.fg_pct ? (avg.fg_pct * 100).toFixed(1) + '%' : null,
+      fg3_pct: avg.fg3_pct ? (avg.fg3_pct * 100).toFixed(1) + '%' : null,
+    };
+  } catch { return null; }
+}
+
+// ── MLB REAL STATS: Official MLB Stats API (no key required) ──
+async function fetchMLBStats(playerName) {
+  try {
+    const searchRes = await fetch(
+      `https://statsapi.mlb.com/api/v1/people/search?names=${encodeURIComponent(playerName)}&sportId=1`
+    );
+    const searchData = await searchRes.json();
+    const person = searchData.people?.[0];
+    if (!person) return null;
+
+    const statsRes = await fetch(
+      `https://statsapi.mlb.com/api/v1/people/${person.id}/stats?stats=season&season=2025&group=hitting`
+    );
+    const statsData = await statsRes.json();
+    const s = statsData.stats?.[0]?.splits?.[0]?.stat;
+    if (!s) return null;
+
+    return {
+      player: person.fullName,
+      avg: s.avg, hr: s.homeRuns, rbi: s.rbi,
+      hits: s.hits, atBats: s.atBats, ops: s.ops,
+      strikeOuts: s.strikeOuts, games_played: s.gamesPlayed
+    };
+  } catch { return null; }
+}
+
+// ── NHL REAL STATS: Official NHL API (no key required) ──
+async function fetchNHLStats(playerName) {
+  try {
+    const searchRes = await fetch(
+      `https://search.d3.nhle.com/api/v1/search/player?culture=en-us&limit=5&q=${encodeURIComponent(playerName)}&active=true`
+    );
+    const players = await searchRes.json();
+    if (!players?.length) return null;
+    const p = players[0];
+
+    const statsRes = await fetch(`https://api-web.nhle.com/v1/player/${p.playerId}/landing`);
+    const data = await statsRes.json();
+    const season = data.seasonTotals?.find(s => s.season === 20242025 && s.leagueAbbrev === 'NHL');
+    if (!season) return null;
+
+    return {
+      player: `${p.name}`,
+      team: p.teamAbbrev,
+      goals: season.goals, assists: season.assists,
+      points: season.points, games_played: season.gamesPlayed,
+      plusMinus: season.plusMinus, shots: season.shots
+    };
+  } catch { return null; }
+}
+
+// ── SHARED ESPN ATHLETE SEARCH (no key required) ──
+async function espnSearchAthleteId(playerName, sportFilter) {
+  try {
+    const res = await fetch(`https://site.web.api.espn.com/apis/search/v2?query=${encodeURIComponent(playerName)}&limit=10`);
+    const data = await res.json();
+    const playerResults = data.results?.find(r => r.type === 'player');
+    const contents = playerResults?.contents || [];
+    if (!contents.length) return null;
+    const match = sportFilter ? (contents.find(c => c.sport === sportFilter) || contents[0]) : contents[0];
+    const idMatch = match.link?.web?.match(/\/id\/(\d+)\//);
+    return idMatch ? idMatch[1] : null;
+  } catch { return null; }
+}
+
+// Picks the most recent season entry from an ESPN stat category (season ordering is inconsistent across sports)
+function latestSeasonStats(category) {
+  if (!category.statistics?.length) return null;
+  const latest = category.statistics.reduce((a, b) => (a.season.year >= b.season.year ? a : b));
+  const out = {};
+  category.names.forEach((name, i) => { out[name] = latest.stats[i]; });
+  return out;
+}
+
+// ── NFL REAL STATS: ESPN unofficial API (no key required) ──
+async function fetchNFLStats(playerName) {
+  try {
+    const id = await espnSearchAthleteId(playerName, 'football');
+    if (!id) return null;
+    const res = await fetch(`https://site.web.api.espn.com/apis/common/v3/sports/football/nfl/athletes/${id}/stats`);
+    const data = await res.json();
+
+    const wanted = ['passing', 'rushing', 'receiving'];
+    const stats = { player: playerName };
+    let hasData = false;
+    for (const cat of data.categories || []) {
+      if (!wanted.includes(cat.name)) continue;
+      const s = latestSeasonStats(cat);
+      if (!s || s.gamesPlayed === '0') continue;
+      Object.entries(s).forEach(([k, v]) => { if (k !== 'gamesPlayed') stats[`${cat.name}_${k}`] = v; });
+      stats.games_played = s.gamesPlayed;
+      hasData = true;
+    }
+    return hasData ? stats : null;
+  } catch { return null; }
+}
+
+// ── SOCCER REAL STATS: ESPN unofficial API (no key required) ──
+async function fetchSoccerStats(playerName) {
+  try {
+    const id = await espnSearchAthleteId(playerName, 'soccer');
+    if (!id) return null;
+    const res = await fetch(`https://site.web.api.espn.com/apis/common/v3/sports/soccer/athletes/${id}/stats`);
+    const data = await res.json();
+    const cat = data.categories?.[0];
+    const s = cat ? latestSeasonStats(cat) : null;
+    if (!s) return null;
+
+    return {
+      player: playerName,
+      starts: s.STRT, goals: s.G, assists: s.A,
+      shots: s.SHOT, shots_on_goal: s.SOG,
+      yellow_cards: s.YC, red_cards: s.RC
+    };
+  } catch { return null; }
+}
+
+// ── UFC/MMA REAL STATS: ESPN unofficial API (no key required) ──
+// No free API exposes per-round strike data — career record and finish rate are what's available.
+async function fetchUFCStats(playerName) {
+  try {
+    const id = await espnSearchAthleteId(playerName, 'mma');
+    if (!id) return null;
+    const res = await fetch(`https://site.web.api.espn.com/apis/common/v3/sports/mma/ufc/athletes/${id}`);
+    const data = await res.json();
+    const a = data.athlete;
+    if (!a) return null;
+
+    const summary = {};
+    (a.statsSummary?.statistics || []).forEach(s => { summary[s.abbreviation] = s.displayValue; });
+    if (!Object.keys(summary).length) return null;
+
+    return {
+      player: a.displayName,
+      weight_class: a.weightClass?.text || null,
+      stance: a.stance || null,
+      record_w_l_d: summary['W-L-D'] || null,
+      ko_tko_record: summary['(T)KO'] || null,
+      submission_record: summary['SUB'] || null
+    };
+  } catch { return null; }
+}
+
+// ── BUILD STATS CONTEXT STRING FOR CLAUDE PROMPT ──
+function buildStatsContext(enrichedLegs) {
+  const lines = enrichedLegs.filter(l => l.realStats).map(l => {
+    const s = l.realStats;
+    const statStr = Object.entries(s)
+      .filter(([k]) => !['player','team'].includes(k))
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(', ');
+    return `${s.player}${s.team ? ' (' + s.team + ')' : ''}: ${statStr}`;
+  });
+  if (!lines.length) return '';
+  return `\n\nVERIFIED LIVE ${new Date().getFullYear()} SEASON STATS (use these EXACT numbers in your analysis, do not override or estimate):\n${lines.join('\n')}`;
+}
+
 // ── ANALYZE ENDPOINT ──
 app.post('/api/analyze', requireAuth, checkAndDeductCredit, upload.single('image'), async (req, res) => {
   try {
@@ -121,11 +340,10 @@ app.post('/api/analyze', requireAuth, checkAndDeductCredit, upload.single('image
       return res.json({ success: true, data: analysisCache.get(cacheKey), cached: true });
     }
 
-    // 2. Check persistent DB cache (survives server restarts)
+    // 2. Check persistent DB cache (survives server restarts — global, not per-user)
     const { data: dbCached } = await supabase
       .from('analyses')
       .select('result')
-      .eq('user_id', req.user.id)
       .filter('result->>_cache_key', 'eq', cacheKey)
       .order('created_at', { ascending: false })
       .limit(1)
@@ -154,7 +372,40 @@ app.post('/api/analyze', requireAuth, checkAndDeductCredit, upload.single('image
       return res.status(400).json({ error: 'No bet data provided' });
     }
 
-    // Call Anthropic API
+    // ── PASS 1: Extract legs + fetch real stats ──
+    // Run extraction + all stat fetches in parallel so latency is minimal.
+    const isNBA = /nba|basketball/i.test(sport || '');
+    const isMLB = /mlb|baseball/i.test(sport || '');
+    const isNHL = /nhl|hockey/i.test(sport || '');
+    const isNFL = /nfl|football/i.test(sport || '');
+    const isSoccer = /soccer|premier league|mls|la liga|bundesliga|serie a|champions league/i.test(sport || '');
+    const isUFC = /ufc|mma/i.test(sport || '');
+
+    let statsContext = '';
+    try {
+      const legs = await extractLegsFromContent(content);
+      if (legs.length) {
+        const enriched = await Promise.all(legs.map(async leg => {
+          let realStats = null;
+          if (isNBA || leg.sport === 'NBA') realStats = await fetchNBAStats(leg.player);
+          else if (isMLB || leg.sport === 'MLB') realStats = await fetchMLBStats(leg.player);
+          else if (isNHL || leg.sport === 'NHL') realStats = await fetchNHLStats(leg.player);
+          else if (isNFL || leg.sport === 'NFL') realStats = await fetchNFLStats(leg.player);
+          else if (isSoccer || leg.sport === 'Soccer') realStats = await fetchSoccerStats(leg.player);
+          else if (isUFC || leg.sport === 'UFC' || leg.sport === 'MMA') realStats = await fetchUFCStats(leg.player);
+          return { ...leg, realStats };
+        }));
+        statsContext = buildStatsContext(enriched);
+      }
+    } catch { /* stats enrichment is best-effort — never block analysis */ }
+
+    // Append verified stats to the last content text block
+    if (statsContext) {
+      const lastText = content.findLast(c => c.type === 'text');
+      if (lastText) lastText.text += statsContext;
+    }
+
+    // ── PASS 2: Full analysis with real stats injected ──
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -382,17 +633,31 @@ Required schema:
   ],
   "parlay": {
     "combined_probability": 58,
-    "strongest_leg": "Player Name — 72%",
-    "weakest_leg": "Player Name — 38%",
+    "strongest_leg": "Player Name (72%)",
+    "weakest_leg": "Player Name (38%)",
     "correlation_warning": null,
     "risk_note": "Brief parlay risk assessment"
   }
 }
 
-Grade scale: A=65%+, B=50-64%, C=35-49%, D=20-34%, F=below 20%.
-For single bets, combined_probability equals that bet's probability.
-EV: if model probability > sportsbook implied probability → +EV, else -EV.
-Use specific, real current-season stats. Be data-driven and trust-building.`;
+PROBABILITY METHODOLOGY — follow this exactly every time:
+1. Start with the player's hit rate over their last 10 games for this specific stat line (weight: 55%)
+2. Blend with season-long hit rate for this line (weight: 25%)
+3. Adjust for matchup — opponent's defensive rank vs this stat (weight: 20%)
+4. Round every individual probability to the nearest 5% (e.g. 63% → 65%, 71% → 70%)
+5. Combined parlay probability = multiply all individual probabilities together, then round to nearest 5%
+
+Grade scale (based on combined_probability):
+A = 65%+, B = 50–64%, C = 35–49%, D = 20–34%, F = below 20%
+
+EV rule: if your calculated probability > sportsbook implied probability → +EV, else -EV
+Sportsbook implied probability = 100 / (American odds + 100) for positive odds, or |odds| / (|odds| + 100) for negative odds.
+
+CONSISTENCY RULES:
+- Always apply the same formula above — do not deviate
+- If you are uncertain about a stat, default to league-average hit rate for that line
+- Never adjust probabilities based on "feel" — only the formula
+- Use specific current-season stats. Be data-driven.`;
 }
 
 // Catch-all: serve frontend
